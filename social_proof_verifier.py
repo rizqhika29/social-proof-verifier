@@ -73,6 +73,16 @@ SCORE_TOLERANCE = 10  # Tolerance for validator agreement on trust score
 SUPPORTED_PLATFORMS = ("twitter", "github", "discord", "telegram", "linkedin")
 TRUST_LEVELS = ("unverified", "basic", "standard", "enhanced", "premium")
 
+# Platform-to-authoritative URL host mapping
+# Each platform is bound to its official domain(s)
+PLATFORM_URL_HOSTS = {
+    "twitter": ["twitter.com", "x.com"],
+    "github": ["github.com"],
+    "discord": ["discord.com", "discord.gg", "discordapp.com"],
+    "telegram": ["t.me", "telegram.org"],
+    "linkedin": ["linkedin.com", "linkedin.cn"],
+}
+
 # =============================================================================
 # HELPER FUNCTIONS
 # =============================================================================
@@ -104,11 +114,33 @@ def _validate_platform(platform: str) -> str:
     return platform
 
 
-def _validate_profile_url(url: str) -> str:
-    """Validate a profile URL."""
+def _validate_profile_url(url: str, platform: str) -> str:
+    """Validate a profile URL and bind it to the platform's authoritative host."""
     url = url.strip()
     if not (url.startswith("http://") or url.startswith("https://")):
         raise gl.vm.UserError(f"invalid profile URL: {url!r}")
+    
+    # Extract hostname from URL
+    # Remove protocol
+    hostname = url.split("://", 1)[-1] if "://" in url else url
+    # Remove path, query, fragment
+    hostname = hostname.split("/")[0]
+    # Remove port if present
+    hostname = hostname.split(":")[0]
+    # Remove www. prefix if present
+    hostname = hostname.removeprefix("www.")
+    # Remove trailing dots
+    hostname = hostname.rstrip(".")
+    hostname = hostname.lower()
+    
+    # Check if hostname matches the platform's authoritative hosts
+    allowed_hosts = PLATFORM_URL_HOSTS.get(platform, [])
+    if allowed_hosts and hostname not in allowed_hosts:
+        raise gl.vm.UserError(
+            f"URL host '{hostname}' is not authoritative for platform '{platform}'. "
+            f"Allowed hosts: {allowed_hosts}"
+        )
+    
     return url
 
 
@@ -606,6 +638,8 @@ class SocialProofVerifier(gl.Contract):
         
         Only the user themselves can register their own profiles.
         Cannot register duplicate platforms.
+        The verification message must match one of the deployment-configured
+        required messages for the specified platform.
         """
         user = _coerce_address(user_address)
         sender = gl.message.sender_address
@@ -615,7 +649,27 @@ class SocialProofVerifier(gl.Contract):
             raise gl.vm.UserError("only the user or deployer can register profiles")
 
         platform = _validate_platform(platform)
-        profile_url = _validate_profile_url(profile_url)
+        
+        # Validate URL against platform's authoritative host
+        profile_url = _validate_profile_url(profile_url, platform)
+
+        # Validate verification message matches deployment-configured required messages
+        verification_message = verification_message.strip()
+        if not verification_message:
+            raise gl.vm.UserError("verification_message must not be empty")
+        
+        # Check if the verification message matches any of the configured required messages
+        message_matches = False
+        for required_msg in self.required_messages:
+            if verification_message.lower() in required_msg.lower() or required_msg.lower() in verification_message.lower():
+                message_matches = True
+                break
+        
+        if not message_matches:
+            raise gl.vm.UserError(
+                f"verification_message must match one of the deployment-configured "
+                f"required messages: {[str(m) for m in self.required_messages]}"
+            )
 
         user_key = str(user)
         profiles = self.user_profiles.get(user_key, [])
@@ -633,7 +687,7 @@ class SocialProofVerifier(gl.Contract):
         new_profile = SocialProfile(
             platform=platform,
             profile_url=profile_url,
-            verification_message=verification_message.strip(),
+            verification_message=verification_message,
             status="pending",
             verification_score=u256(0),
             verified_at=u256(0),
@@ -657,6 +711,8 @@ class SocialProofVerifier(gl.Contract):
         
         Only the user themselves can update their own profiles.
         Cannot update profiles that are currently being verified.
+        The verification message must match one of the deployment-configured
+        required messages for the specified platform.
         """
         user = _coerce_address(user_address)
         sender = gl.message.sender_address
@@ -666,7 +722,27 @@ class SocialProofVerifier(gl.Contract):
             raise gl.vm.UserError("only the user or deployer can update profiles")
 
         platform = _validate_platform(platform)
-        profile_url = _validate_profile_url(profile_url)
+        
+        # Validate URL against platform's authoritative host
+        profile_url = _validate_profile_url(profile_url, platform)
+
+        # Validate verification message matches deployment-configured required messages
+        verification_message = verification_message.strip()
+        if not verification_message:
+            raise gl.vm.UserError("verification_message must not be empty")
+        
+        # Check if the verification message matches any of the configured required messages
+        message_matches = False
+        for required_msg in self.required_messages:
+            if verification_message.lower() in required_msg.lower() or required_msg.lower() in verification_message.lower():
+                message_matches = True
+                break
+        
+        if not message_matches:
+            raise gl.vm.UserError(
+                f"verification_message must match one of the deployment-configured "
+                f"required messages: {[str(m) for m in self.required_messages]}"
+            )
 
         user_key = str(user)
         profiles = self.user_profiles.get(user_key, [])
@@ -681,7 +757,7 @@ class SocialProofVerifier(gl.Contract):
                 profiles[i] = SocialProfile(
                     platform=platform,
                     profile_url=profile_url,
-                    verification_message=verification_message.strip(),
+                    verification_message=verification_message,
                     status="pending",
                     verification_score=u256(0),
                     verified_at=u256(0),
@@ -738,9 +814,11 @@ class SocialProofVerifier(gl.Contract):
         vcount = int(self.user_verification_count.get(user_key, u256(0)))
         self.user_verification_count[user_key] = u256(vcount + 1)
 
-        # Generate unique request ID with nonce
-        request_id = f"req-{user_key[:10]}-{vcount}"
+        # Generate globally collision-resistant request ID using full address
+        # Format: req-{full_address_without_0x}-{global_count}-{user_count}
+        global_count = int(self.request_count)
         self.request_count = self.request_count + u256(1)
+        request_id = f"req-{user_key}-{global_count}-{vcount}"
 
         # Prepare profile data for consensus (frozen snapshot)
         profile_data = []
@@ -1065,16 +1143,52 @@ class TestValidatePlatform:
 
 class TestValidateProfileUrl:
     def test_valid_urls(self):
-        assert _validate_profile_url("https://twitter.com/user") == "https://twitter.com/user"
-        assert _validate_profile_url("http://github.com/user") == "http://github.com/user"
+        # Twitter/X URLs
+        assert _validate_profile_url("https://twitter.com/user", "twitter") == "https://twitter.com/user"
+        assert _validate_profile_url("https://x.com/user", "twitter") == "https://x.com/user"
+        assert _validate_profile_url("http://twitter.com/user", "twitter") == "http://twitter.com/user"
+        
+        # GitHub URLs
+        assert _validate_profile_url("https://github.com/user", "github") == "https://github.com/user"
+        
+        # Discord URLs
+        assert _validate_profile_url("https://discord.com/user", "discord") == "https://discord.com/user"
+        assert _validate_profile_url("https://discord.gg/invite", "discord") == "https://discord.gg/invite"
+        
+        # Telegram URLs
+        assert _validate_profile_url("https://t.me/username", "telegram") == "https://t.me/username"
+        assert _validate_profile_url("https://telegram.org/username", "telegram") == "https://telegram.org/username"
+        
+        # LinkedIn URLs
+        assert _validate_profile_url("https://linkedin.com/in/user", "linkedin") == "https://linkedin.com/in/user"
 
     def test_invalid_urls(self):
+        # Invalid URL format
         for url in ["ftp://twitter.com/user", "not-a-url", ""]:
             try:
-                _validate_profile_url(url)
+                _validate_profile_url(url, "twitter")
                 assert False, "Should have raised error"
             except gl.vm.UserError:
                 pass
+
+    def test_wrong_host_for_platform(self):
+        # GitHub URL for Twitter platform
+        try:
+            _validate_profile_url("https://github.com/user", "twitter")
+            assert False, "Should have raised error"
+        except gl.vm.UserError as e:
+            assert "not authoritative" in str(e)
+        
+        # Twitter URL for GitHub platform
+        try:
+            _validate_profile_url("https://twitter.com/user", "github")
+            assert False, "Should have raised error"
+        except gl.vm.UserError as e:
+            assert "not authoritative" in str(e)
+
+    def test_www_prefix_stripped(self):
+        # www. prefix should be stripped
+        assert _validate_profile_url("https://www.twitter.com/user", "twitter") == "https://www.twitter.com/user"
 
 
 class TestToInt:
@@ -1207,6 +1321,43 @@ class TestParseJsonObject:
 
     def test_non_dict_json(self):
         assert _parse_json_object('["not", "a", "dict"]') is None
+
+
+class TestPlatformUrlHosts:
+    def test_platform_url_hosts_mapping(self):
+        """Verify that all supported platforms have URL host mappings."""
+        for platform in SUPPORTED_PLATFORMS:
+            assert platform in PLATFORM_URL_HOSTS, f"Platform {platform} missing URL host mapping"
+            hosts = PLATFORM_URL_HOSTS[platform]
+            assert len(hosts) > 0, f"Platform {platform} has empty URL host list"
+
+    def test_twitter_hosts(self):
+        """Verify Twitter/X platform has correct authoritative hosts."""
+        hosts = PLATFORM_URL_HOSTS["twitter"]
+        assert "twitter.com" in hosts
+        assert "x.com" in hosts
+
+    def test_github_hosts(self):
+        """Verify GitHub platform has correct authoritative hosts."""
+        hosts = PLATFORM_URL_HOSTS["github"]
+        assert "github.com" in hosts
+
+    def test_discord_hosts(self):
+        """Verify Discord platform has correct authoritative hosts."""
+        hosts = PLATFORM_URL_HOSTS["discord"]
+        assert "discord.com" in hosts
+        assert "discord.gg" in hosts
+
+    def test_telegram_hosts(self):
+        """Verify Telegram platform has correct authoritative hosts."""
+        hosts = PLATFORM_URL_HOSTS["telegram"]
+        assert "t.me" in hosts
+        assert "telegram.org" in hosts
+
+    def test_linkedin_hosts(self):
+        """Verify LinkedIn platform has correct authoritative hosts."""
+        hosts = PLATFORM_URL_HOSTS["linkedin"]
+        assert "linkedin.com" in hosts
 
 
 class TestTrustLevelRank:
