@@ -6,10 +6,10 @@ On-chain identity verification via social media proof for GenLayer.
 
 | Field | Value |
 |-------|-------|
-| **Address** | `0x76cEd526f6F7A52322d0F319Fe6711Ef2B176416` |
+| **Address** | `0x0E2449114671C042210496360c7663EBE999D55d` |
 | **Network** | GenLayer Studio (studionet) |
 | **Chain ID** | 61999 |
-| **Explorer** | [View on Explorer](https://explorer-studio.genlayer.com/address/0x76cEd526f6F7A52322d0F319Fe6711Ef2B176416) |
+| **Explorer** | [View on Explorer](https://explorer-studio.genlayer.com/address/0x0E2449114671C042210496360c7663EBE999D55d) |
 | **Deployer** | `0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf` |
 
 ## Overview
@@ -23,10 +23,19 @@ Users register social media profiles (Twitter, GitHub, Discord, etc.) and specif
 - **Deterministic trust scoring**: 0-100 score with 5 levels (unverified → premium)
 - **Composable primitive**: `get_verified(address, min_trust_score)`
 - **Security hardening**: Based on staff GenLayer feedback from previous contracts
+- **Platform-message mapping**: Verification messages must match deployment-configured messages
+- **Platform URL binding**: URLs must match platform's authoritative hosts
+- **Collision-resistant request IDs**: Full address + global count + user count
 
 ## Supported Platforms
 
-Twitter, GitHub, Discord, Telegram, LinkedIn
+| Platform | Authoritative URL Hosts |
+|----------|------------------------|
+| Twitter | twitter.com, x.com |
+| GitHub | github.com |
+| Discord | discord.com, discord.gg, discordapp.com |
+| Telegram | t.me, telegram.org |
+| LinkedIn | linkedin.com, linkedin.cn |
 
 ## Trust Levels
 
@@ -48,17 +57,19 @@ from eth_account import Account
 account = Account.from_key("your_private_key")
 client = create_client(chain=studionet, account=account)
 
-CONTRACT_ADDRESS = "0x76cEd526f6F7A52322d0F319Fe6711Ef2B176416"
+CONTRACT_ADDRESS = "0x0E2449114671C042210496360c7663EBE999D55d"
 
 # Get scheme info
 scheme = client.read_contract(CONTRACT_ADDRESS, "get_scheme")
+print(f"Required messages: {scheme['required_messages']}")
 
-# Register profile
+# Register profile (verification message must match deployment-configured messages)
+# For this contract, required messages are: ["@genlayer", "verify"]
 client.write_contract(
     CONTRACT_ADDRESS,
     "register_profile",
     account=account,
-    args=[user_address, "twitter", "https://twitter.com/user", "@myhandle"]
+    args=[user_address, "twitter", "https://twitter.com/user", "@genlayer verify"]
 )
 
 # Request verification
