@@ -105,12 +105,10 @@ def _coerce_address(value) -> Address:
 
 
 def _validate_platform(platform: str) -> str:
-    """Validate and normalize a platform name."""
+    """Validate and normalize a platform name format."""
     platform = platform.strip().lower()
-    if platform not in SUPPORTED_PLATFORMS:
-        raise gl.vm.UserError(
-            f"unsupported platform: {platform}. Must be one of {SUPPORTED_PLATFORMS}"
-        )
+    if not platform:
+        raise gl.vm.UserError("platform name must not be empty")
     return platform
 
 
@@ -380,7 +378,7 @@ def _consensus_leader(
     profiles: list[dict],
     scheme_name: str,
     verification_rubric: str,
-    required_messages: list[str],
+    platform_to_messages: dict[str, list[str]],
     score_history: list[int] | None = None,
 ) -> dict:
     """Runs independently on every validator. Fetches each social media profile,
@@ -398,7 +396,17 @@ def _consensus_leader(
     for profile in profiles:
         platform = profile["platform"]
         url = profile["profile_url"]
+        
+        # Get platform-specific required messages
+        platform_msgs = platform_to_messages.get(platform, [])
         required_msg = profile.get("verification_message", "")
+        
+        # Verify the message is valid for this platform
+        msg_valid = False
+        for pm in platform_msgs:
+            if required_msg.lower() in pm.lower() or pm.lower() in required_msg.lower():
+                msg_valid = True
+                break
 
         # Bind to the exact URL that was registered
         platform_urls[platform] = url
@@ -415,11 +423,13 @@ VERIFICATION RUBRIC:
 PLATFORM: {platform}
 PROFILE URL: {url}
 REQUIRED MESSAGE TO FIND: {required_msg}
+PLATFORM'S ALLOWED MESSAGES: {platform_msgs}
 
 PROFILE CONTENT:
 {text}
 
 Check if the profile contains the required message or evidence of the claimed identity.
+The message must match one of the platform's allowed messages.
 Score the verification quality from 0 to 100:
 - 100: Clear, unambiguous match with strong evidence
 - 75: Good match with minor ambiguities
@@ -480,7 +490,7 @@ def _consensus_validator(
     profiles: list[dict],
     scheme_name: str,
     verification_rubric: str,
-    required_messages: list[str],
+    platform_to_messages: dict[str, list[str]],
     tolerance: int = SCORE_TOLERANCE,
     score_history: list[int] | None = None,
 ) -> bool:
@@ -505,7 +515,7 @@ def _consensus_validator(
 
     # Re-run verification independently with same inputs
     my_data = _consensus_leader(
-        profiles, scheme_name, verification_rubric, required_messages,
+        profiles, scheme_name, verification_rubric, platform_to_messages,
         score_history=score_history,
     )
     if not _consensus_ok(my_data, len(profiles)):
@@ -565,10 +575,13 @@ class SocialProofVerifier(gl.Contract):
     
     scheme_name: str
     verification_rubric: str
-    supported_platforms: DynArray[str]
-    required_messages: DynArray[str]
     cooldown_seconds: u256
     deployer: Address
+    
+    # Deployment-configured platform-to-message mapping (parallel arrays)
+    # platform_names[i] -> platform_required_messages[i]
+    platform_names: DynArray[str]
+    platform_required_messages: DynArray[str]
     
     # User profiles: address_key -> DynArray[SocialProfile]
     user_profiles: TreeMap[str, DynArray[SocialProfile]]
@@ -610,19 +623,40 @@ class SocialProofVerifier(gl.Contract):
         if not self.verification_rubric:
             raise gl.vm.UserError("verification_rubric must not be empty")
 
-        platforms = [_validate_platform(p) for p in supported_platforms]
-        if not platforms:
+        validated_platforms = [_validate_platform(p) for p in supported_platforms]
+        if not validated_platforms:
             raise gl.vm.UserError("at least one platform must be supported")
 
-        for p in platforms:
-            self.supported_platforms.append(p)
+        if len(validated_platforms) != len(required_messages):
+            raise gl.vm.UserError("supported_platforms and required_messages must have the same length")
 
-        for msg in required_messages:
-            self.required_messages.append(msg.strip())
+        for platform, message in zip(validated_platforms, required_messages):
+            stripped_msg = message.strip()
+            if not stripped_msg:
+                raise gl.vm.UserError(f"required message must not be empty for platform '{platform}'")
+            self.platform_names.append(platform)
+            self.platform_required_messages.append(stripped_msg)
 
         self.cooldown_seconds = u256(int(cooldown_seconds))
         self.deployer = gl.message.sender_address
         self.request_count = u256(0)
+
+    def _get_platform_index(self, platform: str) -> int:
+        """Find index of a platform in the platform_names array. Returns -1 if not found."""
+        for i in range(len(self.platform_names)):
+            if self.platform_names[i] == platform:
+                return i
+        return -1
+
+    def _get_required_message(self, platform: str) -> str:
+        """Get the required message for a platform. Raises if platform not configured."""
+        idx = self._get_platform_index(platform)
+        if idx == -1:
+            raise gl.vm.UserError(
+                f"platform '{platform}' is not configured. "
+                f"Supported platforms: {[str(p) for p in self.platform_names]}"
+            )
+        return self.platform_required_messages[idx]
 
     # --- Write Methods ---
 
@@ -638,8 +672,8 @@ class SocialProofVerifier(gl.Contract):
         
         Only the user themselves can register their own profiles.
         Cannot register duplicate platforms.
-        The verification message must match one of the deployment-configured
-        required messages for the specified platform.
+        Platform must be in the deployment-configured platform_to_messages.
+        Verification message must match one of the platform's required messages.
         """
         user = _coerce_address(user_address)
         sender = gl.message.sender_address
@@ -650,6 +684,13 @@ class SocialProofVerifier(gl.Contract):
 
         platform = _validate_platform(platform)
         
+        # Check if platform exists in deployment config
+        if self._get_platform_index(platform) == -1:
+            raise gl.vm.UserError(
+                f"platform '{platform}' is not configured. "
+                f"Supported platforms: {[str(p) for p in self.platform_names]}"
+            )
+        
         # Validate URL against platform's authoritative host
         profile_url = _validate_profile_url(profile_url, platform)
 
@@ -658,17 +699,11 @@ class SocialProofVerifier(gl.Contract):
         if not verification_message:
             raise gl.vm.UserError("verification_message must not be empty")
         
-        # Check if the verification message matches any of the configured required messages
-        message_matches = False
-        for required_msg in self.required_messages:
-            if verification_message.lower() in required_msg.lower() or required_msg.lower() in verification_message.lower():
-                message_matches = True
-                break
-        
-        if not message_matches:
+        # Get platform-specific required message
+        required_msg = self._get_required_message(platform)
+        if not (verification_message.lower() in required_msg.lower() or required_msg.lower() in verification_message.lower()):
             raise gl.vm.UserError(
-                f"verification_message must match one of the deployment-configured "
-                f"required messages: {[str(m) for m in self.required_messages]}"
+                f"verification_message must match the required message for '{platform}': '{required_msg}'"
             )
 
         user_key = str(user)
@@ -711,8 +746,8 @@ class SocialProofVerifier(gl.Contract):
         
         Only the user themselves can update their own profiles.
         Cannot update profiles that are currently being verified.
-        The verification message must match one of the deployment-configured
-        required messages for the specified platform.
+        Platform must be in the deployment-configured platform_to_messages.
+        Verification message must match one of the platform's required messages.
         """
         user = _coerce_address(user_address)
         sender = gl.message.sender_address
@@ -723,6 +758,13 @@ class SocialProofVerifier(gl.Contract):
 
         platform = _validate_platform(platform)
         
+        # Check if platform exists in deployment config
+        if self._get_platform_index(platform) == -1:
+            raise gl.vm.UserError(
+                f"platform '{platform}' is not configured. "
+                f"Supported platforms: {[str(p) for p in self.platform_names]}"
+            )
+        
         # Validate URL against platform's authoritative host
         profile_url = _validate_profile_url(profile_url, platform)
 
@@ -731,17 +773,11 @@ class SocialProofVerifier(gl.Contract):
         if not verification_message:
             raise gl.vm.UserError("verification_message must not be empty")
         
-        # Check if the verification message matches any of the configured required messages
-        message_matches = False
-        for required_msg in self.required_messages:
-            if verification_message.lower() in required_msg.lower() or required_msg.lower() in verification_message.lower():
-                message_matches = True
-                break
-        
-        if not message_matches:
+        # Get platform-specific required message
+        required_msg = self._get_required_message(platform)
+        if not (verification_message.lower() in required_msg.lower() or required_msg.lower() in verification_message.lower()):
             raise gl.vm.UserError(
-                f"verification_message must match one of the deployment-configured "
-                f"required messages: {[str(m) for m in self.required_messages]}"
+                f"verification_message must match the required message for '{platform}': '{required_msg}'"
             )
 
         user_key = str(user)
@@ -834,7 +870,11 @@ class SocialProofVerifier(gl.Contract):
 
         scheme_name = self.scheme_name
         rubric = self.verification_rubric
-        required_msgs = [m for m in self.required_messages]
+        
+        # Build platform-to-messages mapping for consensus from parallel arrays
+        platform_msgs = {}
+        for i in range(len(self.platform_names)):
+            platform_msgs[self.platform_names[i]] = [self.platform_required_messages[i]]
 
         # Mark profiles as being verified (check_count incremented)
         for i, p in enumerate(profiles):
@@ -844,13 +884,13 @@ class SocialProofVerifier(gl.Contract):
         # Non-deterministic consensus block
         def leader_fn():
             return _consensus_leader(
-                profile_data, scheme_name, rubric, required_msgs,
+                profile_data, scheme_name, rubric, platform_msgs,
                 score_history=hist,
             )
 
         def validator_fn(leaders_res):
             return _consensus_validator(
-                leaders_res, profile_data, scheme_name, rubric, required_msgs,
+                leaders_res, profile_data, scheme_name, rubric, platform_msgs,
                 SCORE_TOLERANCE, score_history=hist,
             )
 
@@ -930,11 +970,14 @@ class SocialProofVerifier(gl.Contract):
     @gl.public.view
     def get_scheme(self) -> dict:
         """Get the immutable scheme parameters."""
+        platform_msgs = {}
+        for i in range(len(self.platform_names)):
+            platform_msgs[self.platform_names[i]] = [self.platform_required_messages[i]]
+        
         return {
             "scheme_name": self.scheme_name,
             "verification_rubric": self.verification_rubric,
-            "supported_platforms": [p for p in self.supported_platforms],
-            "required_messages": [m for m in self.required_messages],
+            "platform_to_messages": platform_msgs,
             "cooldown_seconds": int(self.cooldown_seconds),
             "deployer": str(self.deployer),
         }
@@ -1133,9 +1176,13 @@ class TestValidatePlatform:
             assert _validate_platform(platform) == platform
             assert _validate_platform(platform.upper()) == platform
 
-    def test_invalid_platform(self):
+    def test_custom_platform_accepted(self):
+        assert _validate_platform("custom_platform") == "custom_platform"
+        assert _validate_platform("  MyPlatform  ") == "myplatform"
+
+    def test_empty_platform_rejected(self):
         try:
-            _validate_platform("invalid_platform")
+            _validate_platform("")
             assert False, "Should have raised error"
         except gl.vm.UserError:
             pass
