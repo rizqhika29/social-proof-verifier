@@ -6,10 +6,10 @@ On-chain identity verification via social media proof for GenLayer.
 
 | Field | Value |
 |-------|-------|
-| **Address** | `0x0E2449114671C042210496360c7663EBE999D55d` |
+| **Address** | `0x5e61Bd46858e86F5E803B47e1999c4fcf79e2A93` |
 | **Network** | GenLayer Studio (studionet) |
 | **Chain ID** | 61999 |
-| **Explorer** | [View on Explorer](https://explorer-studio.genlayer.com/address/0x0E2449114671C042210496360c7663EBE999D55d) |
+| **Explorer** | [View on Explorer](https://explorer-studio.genlayer.com/address/0x5e61Bd46858e86F5E803B47e1999c4fcf79e2A93) |
 | **Deployer** | `0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf` |
 
 ## Overview
@@ -23,7 +23,7 @@ Users register social media profiles (Twitter, GitHub, Discord, etc.) and specif
 - **Deterministic trust scoring**: 0-100 score with 5 levels (unverified → premium)
 - **Composable primitive**: `get_verified(address, min_trust_score)`
 - **Security hardening**: Based on staff GenLayer feedback from previous contracts
-- **Platform-message mapping**: Verification messages must match deployment-configured messages
+- **Platform-message mapping**: Each platform has its own required message (e.g., twitter→"@genlayer", github→"verify")
 - **Platform URL binding**: URLs must match platform's authoritative hosts
 - **Collision-resistant request IDs**: Full address + global count + user count
 
@@ -57,19 +57,20 @@ from eth_account import Account
 account = Account.from_key("your_private_key")
 client = create_client(chain=studionet, account=account)
 
-CONTRACT_ADDRESS = "0x0E2449114671C042210496360c7663EBE999D55d"
+CONTRACT_ADDRESS = "0x5e61Bd46858e86F5E803B47e1999c4fcf79e2A93"
 
-# Get scheme info
+# Get scheme info (shows per-platform required messages)
 scheme = client.read_contract(CONTRACT_ADDRESS, "get_scheme")
-print(f"Required messages: {scheme['required_messages']}")
+print(f"Platform mappings: {scheme['platform_to_messages']}")
+# Output: {'twitter': ['@genlayer'], 'github': ['verify'], ...}
 
-# Register profile (verification message must match deployment-configured messages)
-# For this contract, required messages are: ["@genlayer", "verify"]
+# Register profile (verification message must match that platform's required message)
+# twitter requires "@genlayer", github requires "verify", etc.
 client.write_contract(
     CONTRACT_ADDRESS,
     "register_profile",
     account=account,
-    args=[user_address, "twitter", "https://twitter.com/user", "@genlayer verify"]
+    args=[user_address, "twitter", "https://twitter.com/user", "@genlayer"]
 )
 
 # Request verification
